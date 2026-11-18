@@ -29,12 +29,46 @@ def insert_fact(conn: sqlite3.Connection, **fields: Any) -> int:
     return int(cur.lastrowid)
 
 
-def has_fact_for_coupon(conn: sqlite3.Connection, coupon_code: str) -> bool:
+def get_fact(conn: sqlite3.Connection, fact_id: int) -> dict[str, Any] | None:
+    row = conn.execute("SELECT * FROM redeem_facts WHERE id=?", (int(fact_id),)).fetchone()
+    return dict(row) if row else None
+
+
+def fact_for_event(conn: sqlite3.Connection, event_id: int) -> dict[str, Any] | None:
     row = conn.execute(
-        "SELECT 1 FROM redeem_facts WHERE coupon_code=? LIMIT 1",
+        "SELECT * FROM redeem_facts WHERE event_id=? ORDER BY id LIMIT 1",
+        (int(event_id),),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def fact_for_coupon(conn: sqlite3.Connection, coupon_code: str) -> dict[str, Any] | None:
+    row = conn.execute(
+        "SELECT * FROM redeem_facts WHERE coupon_code=? ORDER BY id LIMIT 1",
         (coupon_code,),
     ).fetchone()
-    return row is not None
+    return dict(row) if row else None
+
+
+def delete_fact(conn: sqlite3.Connection, fact_id: int) -> int:
+    cur = conn.execute("DELETE FROM redeem_facts WHERE id=?", (int(fact_id),))
+    return int(cur.rowcount or 0)
+
+
+def facts_for_batch(conn: sqlite3.Connection, batch_id: int) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        "SELECT * FROM redeem_facts WHERE batch_id=? ORDER BY id",
+        (int(batch_id),),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def reset_batch(conn: sqlite3.Connection, batch_id: int) -> int:
+    cur = conn.execute(
+        "UPDATE redeem_facts SET status='open', batch_id=NULL WHERE batch_id=?",
+        (int(batch_id),),
+    )
+    return int(cur.rowcount or 0)
 
 
 def open_facts_for_day(conn: sqlite3.Connection, business_day: str) -> list[dict[str, Any]]:

@@ -82,7 +82,10 @@ CREATE INDEX IF NOT EXISTS idx_audit_target
 
 
 def connect(immediate: bool = False) -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    # The timeout lets a promotion and a seal that arrive together wait for
+    # each other instead of failing with "database is locked"; the
+    # BEGIN IMMEDIATE below then serialises them on the same file.
+    conn = sqlite3.connect(DB_PATH, timeout=10, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     if immediate:
         conn.execute("BEGIN IMMEDIATE")

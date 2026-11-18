@@ -74,17 +74,48 @@ def counts_for_day(conn: sqlite3.Connection, business_day: str) -> dict[str, Any
     }
 
 
-def mark_promoted(conn: sqlite3.Connection, quarantine_id: int, fact_id: int, note: str) -> None:
-    conn.execute(
+def mark_promoted(conn: sqlite3.Connection, quarantine_id: int, fact_id: int, note: str) -> int:
+    cur = conn.execute(
         "UPDATE redeem_quarantine SET status='promoted', fact_id=?, decision_note=?, "
         "decided_at=? WHERE id=? AND status='quarantined'",
         (int(fact_id), note or "", _now(), int(quarantine_id)),
     )
+    return int(cur.rowcount or 0)
 
 
-def mark_discarded(conn: sqlite3.Connection, quarantine_id: int, note: str) -> None:
-    conn.execute(
+def link_promoted_fact(conn: sqlite3.Connection, quarantine_id: int, fact_id: int) -> int:
+    """Re-point an already-promoted row at the fact that now owns its event."""
+    cur = conn.execute(
+        "UPDATE redeem_quarantine SET fact_id=? WHERE id=? AND status='promoted'",
+        (int(fact_id), int(quarantine_id)),
+    )
+    return int(cur.rowcount or 0)
+
+
+def revert_to_quarantined(conn: sqlite3.Connection, quarantine_id: int) -> int:
+    cur = conn.execute(
+        "UPDATE redeem_quarantine SET status='quarantined', fact_id=NULL, "
+        "decided_at=NULL WHERE id=? AND status='promoted'",
+        (int(quarantine_id),),
+    )
+    return int(cur.rowcount or 0)
+
+
+def force_promoted(conn: sqlite3.Connection, quarantine_id: int, fact_id: int) -> int:
+    """Clear isolation for a terminal row whose event already has a formal fact."""
+    cur = conn.execute(
+        "UPDATE redeem_quarantine SET status='promoted', fact_id=?, decided_at=? "
+        "WHERE id=? AND status<>'promoted'",
+        (int(fact_id), _now(), int(quarantine_id)),
+    )
+    return int(cur.rowcount or 0)
+
+
+def mark_discarded(conn: sqlite3.Connection, quarantine_id: int, note: str) -> int:
+    cur = conn.execute(
         "UPDATE redeem_quarantine SET status='discarded', decision_note=?, "
         "decided_at=? WHERE id=? AND status='quarantined'",
         (note or "", _now(), int(quarantine_id)),
     )
+    return int(cur.rowcount or 0)
+

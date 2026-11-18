@@ -8,11 +8,16 @@
 
 - 事件仍入事件湖（带 `reason_code`），可审计；同笔事务内写 `redeem_quarantine` 行（`reason_code` + 中文原因）。
 - 隔离行**不**物化为 `redeem_facts`，因此天然不进钉扎预览、不进 sealed 合计、不进总览 `redeem_total_today` / `fact_count`；总览单独给出 `illegal_redeem_count`、`quarantine_count` 等隔离计数。
-- 晋升：`POST /api/quarantine/{id}/promote` 重新跑完整校验（活动存在、金额为正、有对应发放、未重复核销、当日未钉扎），通过后才物化为 open 事实。
+- 晋升：`POST /api/quarantine/{id}/promote` 重新跑完整校验（活动存在、金额为正、有对应发放、未重复核销、当日未钉扎），通过后在同一 `BEGIN IMMEDIATE` 事务内物化 open 事实并置 `promoted`；任一臂失败整体回滚，回执为 `success` 时隔离行必已清、正式条必已建。
 - 丢弃：`POST /api/quarantine/{id}/discard`，终态，丢弃后不可晋升。
 - 晋升与丢弃均写 `audit_log`（`GET /api/audit?target_type=quarantine&target_id=`），记录前后金额/活动、原因码与备注。
 - 并发：晋升与钉扎都在 `BEGIN IMMEDIATE` 下执行，故晋升先提交则被钉入 sealed，钉扎先提交则晋升返回 409，不存在未晋升行被钉进 sealed 的中间态。
-- 页面：`/quarantine` 隔离区（晋升/丢弃/审计轨迹）、`/redeem` 预览显示“隔离已排除”、`/events` 显示事件去向、总览显示隔离计数。
+- 边界收口（预览 / 隔离列表 / 事实列表 / 总览 / 钉扎前都会先跑同一套对账）：
+  - 隔离为准：仍在隔离的码/事件一律从预览与 sealed 剔除并回写 `excluded_quarantine_count/amount`；半截 open 正式行（事件仍隔离）回滚删除，不得进批。
+  - 正式为准：事件已有正式事实（尤其已 sealed）时强制清隔离、补 `promote_reconciled` 审计；`promoted` 回执若无对应事实则回滚为 `quarantined`（`promotion_rollback`）。
+  - 半截批次：未到 `sealed` 的批在读取时释放明细并标记 `aborted`，批头按批内明细回写，不得冒充当日现行 sealed。
+  - 计数恒等：`formal_plus_quarantine == event_illegal_plus_legal`，并单独暴露 `dual_home_event_count`、`homeless_event_count`（均应为 0）。
+- 页面：`/quarantine` 隔离区（晋升/丢弃/审计轨迹）、`/redeem` 预览显示“隔离已排除”、`/events` 显示事件去向、总览显示隔离计数与双栖/无处安放计数。
 
 ## 本地
 

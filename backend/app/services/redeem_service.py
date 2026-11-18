@@ -8,113 +8,142 @@ from app.repositories import facts as fact_repo
 from app.repositories import batches as batch_repo
 from app.repositories import quarantine as quarantine_repo
 from app.repositories import audit as audit_repo
+from app.services import quarantine_bridge
 from app.services import redeem_validator
 
 
 def list_facts(business_day: str | None = None) -> list[dict[str, Any]]:
-    conn = connect()
+    conn = connect(immediate=True)
     try:
         day = business_day or settings_repo.get(conn, "business_day")
-        return fact_repo.list_facts(conn, day)
+        # Facts are never shown in a state that contradicts the quarantine
+        # table: a torn half row is rolled back before it can be read.
+        quarantine_bridge.reconcile_batches(conn)
+        quarantine_bridge.reconcile_day(conn, day)
+        rows = fact_repo.list_facts(conn, day)
+        conn.commit()
+        return rows
     finally:
         conn.close()
 
 
 def preview(business_day: str | None = None) -> dict[str, Any]:
-    conn = connect()
+    conn = connect(immediate=True)
     try:
         day = business_day or settings_repo.get(conn, "business_day")
-        from app.services import quarantine_bridge
-        opens, quarantined = quarantine_bridge.merge_open(conn, day)
-        mixed = list(opens) + [
-            {
-                "id": None,
-                "coupon_code": q["coupon_code"],
-                "campaign_code": q["campaign_code"],
-                "amount": q["amount"],
-                "status": "quarantined",
-                "quarantine_id": q["quarantine_id"],
-            }
-            for q in quarantined
-        ]
-        total = round(sum(float(f["amount"]) for f in mixed), 2)
+        # Heal first: the preview is the operator's view of what a seal would
+        # pin, so a fake promotion or a half formal row must be settled before
+        # it is either shown or counted as excluded.
+        quarantine_bridge.reconcile_batches(conn)
+        quarantine_bridge.reconcile_day(conn, day)
+        opens, quarantined = quarantine_bridge.pinnable(conn, day)
+        excluded = quarantine_bridge.excluded_summary(conn, day)
+        total = round(sum(float(f["amount"]) for f in opens), 2)
         q = quarantine_repo.counts_for_day(conn, day)
-        return {
+        result = {
             "business_day": day,
-            "open_count": len(mixed),
+            "open_count": len(opens),
             "open_total": total,
             "already_sealed": fact_repo.day_is_sealed(conn, day),
-            "excluded_quarantine_count": 0,
-            "excluded_quarantine_amount": 0,
+            "excluded_quarantine_count": excluded["count"],
+            "excluded_quarantine_amount": excluded["amount"],
             "quarantine_still": q["quarantine_count"],
-            "facts": mixed,
+            "facts": opens,
         }
+        conn.commit()
+        return result
     finally:
         conn.close()
+
 
 
 def seal(body: dict[str, Any]) -> dict[str, Any]:
     conn = connect(immediate=True)
     try:
         day = body.get("business_day") or settings_repo.get(conn, "business_day")
+        actor = (body.get("actor") or "").strip()
+        # Reconcile first: the quarantine table is authoritative, so any row
+        # still quarantined is excluded, and any fake promotion is rolled back
+        # before it can leak a half formal row into this batch. Torn batches
+        # from an interrupted seal release their rows and never count as the
+        # current sealed batch.
+        batches_fixed = quarantine_bridge.reconcile_batches(conn, actor)
+        fixed = quarantine_bridge.reconcile_day(conn, day, actor)
         if fact_repo.day_is_sealed(conn, day):
             raise HTTPException(409, f"业务日 {day} 已有 sealed 钉扎批")
-        # BEGIN IMMEDIATE serialises this against promotion, so a row promoted
-        # after this point cannot be seen here, and one promoted before is
-        # fully committed and therefore pinned. Quarantined rows are never in
-        # redeem_facts, so they cannot enter the batch by construction.
-        from app.services import quarantine_bridge
-        opens, quarantined = quarantine_bridge.merge_open(conn, day)
-        half = max(1, (len(quarantined) + 1) // 2) if quarantined else 0
-        adopted = quarantine_bridge.materialize(conn, day, half if quarantined else 0)
-        if adopted:
-            known = {int(f["id"]) for f in opens}
-            for row in fact_repo.list_facts(conn, day):
-                if int(row["id"]) in adopted and int(row["id"]) not in known and row["status"] == "open":
-                    opens.append(row)
-        if not opens and not quarantined:
+        opens, quarantined = quarantine_bridge.pinnable(conn, day)
+        if not opens:
             raise HTTPException(400, "无可钉扎的 open 核销事实")
-        header_n = len(opens) + len(quarantined)
-        total = round(
-            sum(float(f["amount"]) for f in opens) + sum(float(q["amount"]) for q in quarantined),
-            2,
-        )
         bid = batch_repo.create_batch(
             conn,
             business_day=day,
-            status="sealed",
-            fact_count=header_n,
-            total_amount=total,
-            sealed_at=datetime.now().replace(microsecond=0).isoformat(),
+            status="pending",
+            fact_count=0,
+            total_amount=0.0,
+            sealed_at=None,
             note=body.get("note") or "",
         )
-        pinned = fact_repo.mark_batched(conn, [int(f["id"]) for f in opens], bid) if opens else 0
-        if pinned != len(opens):
+        pinned = fact_repo.mark_batched(conn, [int(f["id"]) for f in opens], bid)
+        sealed_rows = fact_repo.facts_for_batch(conn, bid)
+        # The header is written from the rows actually pinned, never from the
+        # pre-pin preview, so a half-finished batch can never claim counts it
+        # does not own.
+        fact_count = int(pinned)
+        total = round(sum(float(f["amount"]) for f in sealed_rows), 2)
+        if pinned != len(opens) or len(sealed_rows) != pinned:
             raise HTTPException(409, "钉扎期间 open 事实发生变化，请重试")
+        batch_repo.update_header(conn, bid, fact_count=fact_count, total_amount=total)
+        batch_repo.set_status(conn, bid, "sealed")
+        conn.execute(
+            "UPDATE redeem_batches SET sealed_at=? WHERE id=?",
+            (datetime.now().replace(microsecond=0).isoformat(), bid),
+        )
+        # Invariant at commit time: no still-quarantined row shares an event
+        # with a pinned fact, and the header equals the sum of its own rows.
+        pinned_events = {int(f["event_id"]) for f in sealed_rows}
+        for q in quarantined:
+            if int(q["event_id"]) in pinned_events:  # pragma: no cover - reconcile is the gate
+                raise HTTPException(409, f"隔离行 #{q['quarantine_id']} 与正式事实双栖，拒绝钉扎")
         audit_repo.log(
             conn,
             action="seal",
             target_type="batch",
             target_id=bid,
-            detail={"business_day": day, "fact_count": pinned, "total_amount": total},
-            actor=(body.get("actor") or "").strip(),
+            detail={
+                "business_day": day,
+                "fact_count": fact_count,
+                "total_amount": total,
+                "excluded_quarantine_count": len(quarantined),
+                **fixed,
+                **batches_fixed,
+            },
+            actor=actor,
         )
         conn.commit()
         return {
             "batch_id": bid,
             "business_day": day,
-            "fact_count": pinned,
+            "fact_count": fact_count,
             "total_amount": total,
             "status": "sealed",
+            "excluded_quarantine_count": len(quarantined),
+            "reconciled": {**fixed, **batches_fixed},
         }
     finally:
         conn.close()
 
 
+
 def list_batches() -> list[dict[str, Any]]:
-    conn = connect()
+    # Heal torn batches on read: a batch that never reached ``sealed`` must not
+    # show up as the current pinned batch, and every header is re-derived from
+    # the rows it owns.
+    conn = connect(immediate=True)
     try:
-        return batch_repo.list_batches(conn)
+        quarantine_bridge.reconcile_batches(conn)
+        rows = batch_repo.list_batches(conn)
+        conn.commit()
+        return rows
     finally:
         conn.close()
 
@@ -122,11 +151,18 @@ def list_batches() -> list[dict[str, Any]]:
 def list_quarantine(business_day: str | None = None, status: str | None = None) -> list[dict[str, Any]]:
     if status and status not in quarantine_repo.STATUSES:
         raise HTTPException(400, f"status 须为 {'/'.join(quarantine_repo.STATUSES)}")
-    conn = connect()
+    conn = connect(immediate=True)
     try:
+        # The quarantine page must not tell the operator a row is pending when
+        # the formal fact already exists (or claim success with no fact), so
+        # the same reconciliation the seal runs is applied before listing.
+        quarantine_bridge.reconcile_batches(conn)
+        day = business_day or settings_repo.get(conn, "business_day")
+        quarantine_bridge.reconcile_day(conn, day)
         rows = quarantine_repo.list_rows(conn, business_day, status)
         for r in rows:
             r["reason_label"] = redeem_validator.REASON_LABELS.get(r["reason_code"], r["reason_code"])
+        conn.commit()
         return rows
     finally:
         conn.close()
@@ -138,9 +174,18 @@ def promote(quarantine_id: int, body: dict[str, Any]) -> dict[str, Any]:
         row = quarantine_repo.get(conn, quarantine_id)
         if row is None:
             raise HTTPException(404, "隔离行不存在")
+        day = str(row["business_day"])
+        # Heal a torn state (a fake promotion receipt, a half-written formal
+        # row on an event this table still owns, or a batch stuck before
+        # ``sealed`` that must not count as today's pin) before promoting, so
+        # the decision cannot land on top of a second home for the same key.
+        quarantine_bridge.reconcile_batches(conn, (body.get("actor") or "").strip())
+        quarantine_bridge.reconcile_day(conn, day, (body.get("actor") or "").strip())
+        row = quarantine_repo.get(conn, quarantine_id)
+        if row is None:
+            raise HTTPException(404, "隔离行不存在")
         if row["status"] != "quarantined":
             raise HTTPException(409, f"隔离行当前状态为 {row['status']}，不可晋升")
-        day = str(row["business_day"])
         if fact_repo.day_is_sealed(conn, day):
             raise HTTPException(409, f"业务日 {day} 已钉扎，隔离行不得晋升")
 
@@ -155,6 +200,7 @@ def promote(quarantine_id: int, body: dict[str, Any]) -> dict[str, Any]:
             campaign_code=campaign_code,
             amount=float(amount),
             business_day=day,
+            quarantine_id=quarantine_id,
         )
         if reason_code is not None:
             raise HTTPException(
@@ -162,8 +208,12 @@ def promote(quarantine_id: int, body: dict[str, Any]) -> dict[str, Any]:
                 f"晋升校验未通过: [{reason_code}] {reason}",
             )
 
-        from app.services import quarantine_bridge
-        result = quarantine_bridge.promote_receipt(conn, row, body)
+        fact_id = quarantine_bridge.promote_to_fact(
+            conn,
+            row,
+            amount=float(amount),
+            campaign_code=campaign_code,
+        )
         audit_repo.log(
             conn,
             action="promote",
@@ -171,7 +221,7 @@ def promote(quarantine_id: int, body: dict[str, Any]) -> dict[str, Any]:
             target_id=quarantine_id,
             detail={
                 "event_id": int(row["event_id"]),
-                "fact_id": result["fact_id"],
+                "fact_id": fact_id,
                 "business_day": day,
                 "coupon_code": row["coupon_code"],
                 "claimed_status": "promoted",
@@ -180,7 +230,14 @@ def promote(quarantine_id: int, body: dict[str, Any]) -> dict[str, Any]:
             actor=(body.get("actor") or "").strip(),
         )
         conn.commit()
-        return result
+        return {
+            "quarantine_id": quarantine_id,
+            "fact_id": fact_id,
+            "business_day": day,
+            "status": "promoted",
+            "success": True,
+            "quarantine_status": "promoted",
+        }
     finally:
         conn.close()
 

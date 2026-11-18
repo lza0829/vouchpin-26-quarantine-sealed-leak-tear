@@ -25,12 +25,17 @@ def validate_redeem(
     campaign_code: str,
     amount: float,
     business_day: str,
+    quarantine_id: int | None = None,
 ) -> tuple[str | None, str]:
     """Return (reason_code, reason); reason_code is None when the redeem is legal.
 
     A legal redeem must reference a known campaign, a positive amount, an
     existing issue event for the same coupon *and* campaign, must not already
     have a fact, and must land on a day that is not yet sealed.
+
+    ``quarantine_id`` is set when re-validating a promotion: the fact it may
+    already own (left behind by a half-finished promotion) is not a duplicate,
+    but any other fact for the same coupon is.
     """
     campaign = camp_repo.get_by_code(conn, campaign_code)
     if campaign is None:
@@ -48,7 +53,16 @@ def validate_redeem(
             f"券码 {coupon_code} 发放于 {', '.join(issued_campaigns)}，与核销活动 {campaign_code} 不一致",
         )
 
-    if fact_repo.has_fact_for_coupon(conn, coupon_code):
+    existing = fact_repo.fact_for_coupon(conn, coupon_code)
+    if existing is not None and quarantine_id is not None:
+        owned = conn.execute(
+            "SELECT fact_id FROM redeem_quarantine WHERE id=?",
+            (int(quarantine_id),),
+        ).fetchone()
+        owned_fact = int(owned["fact_id"]) if owned and owned["fact_id"] is not None else None
+        if owned_fact is None or int(existing["id"]) != owned_fact:
+            return "already_redeemed", f"券码 {coupon_code} 已存在核销事实"
+    elif existing is not None:
         return "already_redeemed", f"券码 {coupon_code} 已存在核销事实"
 
     if fact_repo.day_is_sealed(conn, business_day):

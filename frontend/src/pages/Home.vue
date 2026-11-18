@@ -22,11 +22,16 @@ onMounted(load)
       <div class="stat"><div class="k">隔离仍在</div><div class="v">{{ d.quarantine_count }}</div></div>
       <div class="stat"><div class="k">非法核销</div><div class="v">{{ d.illegal_redeem_count }}</div></div>
       <div class="stat"><div class="k">隔离待处理</div><div class="v ticket">{{ d.quarantine_count }}</div></div>
+      <div class="stat"><div class="k">同键双栖</div><div class="v">{{ d.dual_home_event_count }}</div></div>
+      <div class="stat"><div class="k">无处安放</div><div class="v">{{ d.homeless_event_count }}</div></div>
     </div>
     <p class="msg" v-if="d && !err">
       票根洋红标出核销侧数字。非法核销一律进隔离区：不计入核销额、钉扎合计与预览，只能晋升（重新校验通过）或丢弃，且均留审计。
       待处理 {{ d.quarantine_count }} 笔 · 金额 {{ d.quarantine_amount }}；已晋升
       {{ d.quarantine_promoted_count }}、已丢弃 {{ d.quarantine_discarded_count }}。日钉扎后迟到的核销同样只进隔离区，不得晋升。
+      每笔核销事件只有一个归属：正式事实 {{ d.fact_count }} + 隔离未清 {{ d.quarantine_unpromoted_count }}
+      = 事件侧非法 {{ d.illegal_redeem_count }} + 合法 {{ d.legal_redeem_count }} =
+      {{ d.formal_plus_quarantine }} / {{ d.event_illegal_plus_legal }}；同键双栖 {{ d.dual_home_event_count }} 笔、无处安放 {{ d.homeless_event_count }} 笔应为 0。
     </p>
     <p class="msg err" v-if="err">{{ err }}</p>
   </div>
